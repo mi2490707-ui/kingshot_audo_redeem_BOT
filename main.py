@@ -87,28 +87,67 @@ def save_seen_codes(seen: set) -> None:
     )
 
 
+def _find_candidate_lists(node) -> list:
+    """
+    Recursively hunts for lists that plausibly hold gift codes, under any of
+    the common key names sites like this use (giftCodes, codes, activeCodes,
+    list, items), including nested under a "data" wrapper. Returns a list of
+    lists (each a candidate array of code entries).
+    """
+    found = []
+    if isinstance(node, dict):
+        for key in ("giftCodes", "activeCodes", "codes", "list", "items"):
+            value = node.get(key)
+            if isinstance(value, list):
+                found.append(value)
+        # Recurse into common wrapper keys (e.g. {"data": {...}})
+        for key in ("data", "result", "payload"):
+            if key in node:
+                found.extend(_find_candidate_lists(node[key]))
+    elif isinstance(node, list):
+        # A bare top-level list is itself a candidate.
+        found.append(node)
+    return found
+
+
+def _is_expired_entry(item: dict) -> bool:
+    """Best-effort check for an 'expired'/'inactive' flag on a code entry."""
+    if "expired" in item:
+        return bool(item.get("expired"))
+    if "isExpired" in item:
+        return bool(item.get("isExpired"))
+    status = item.get("status")
+    if isinstance(status, str) and status.lower() in ("expired", "inactive", "disabled"):
+        return True
+    if "active" in item and item.get("active") is False:
+        return True
+    if "isActive" in item and item.get("isActive") is False:
+        return True
+    return False
+
+
 def fetch_current_codes() -> list:
-    """Returns a list of code strings from kingshot.net's feed."""
+    """Returns a list of currently-ACTIVE code strings from kingshot.net's feed."""
     resp = requests.get(CODES_FEED_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
 
-    # The feed's exact shape can vary; handle the common possibilities.
-    if isinstance(data, list):
-        raw_items = data
-    elif isinstance(data, dict):
-        raw_items = data.get("codes") or data.get("data") or []
-    else:
-        raw_items = []
+    candidate_lists = _find_candidate_lists(data)
 
     codes = []
-    for item in raw_items:
-        if isinstance(item, str):
-            codes.append(item)
-        elif isinstance(item, dict):
-            code = item.get("code") or item.get("name")
-            if code:
+    seen_in_this_fetch = set()
+    for raw_list in candidate_lists:
+        for item in raw_list:
+            code = None
+            active = True
+            if isinstance(item, str):
+                code = item
+            elif isinstance(item, dict):
+                code = item.get("code") or item.get("name") or item.get("cdk")
+                active = not _is_expired_entry(item)
+            if code and active and code not in seen_in_this_fetch:
                 codes.append(code)
+                seen_in_this_fetch.add(code)
     return codes
 
 
@@ -172,14 +211,54 @@ def interpret_result(result: dict) -> str:
     return f"Response: {msg}"
 
 
-def send_discord_notification(content: str) -> None:
+STATUS_STYLE = {
+    "success": ("✅", 0x57F287),   # green
+    "already": ("ℹ️", 0x5865F2),   # blurple
+    "expired": ("⌛", 0xED4245),   # red
+    "sign_error": ("⚠️", 0xFEE75C),  # yellow
+    "error": ("❌", 0xED4245),     # red
+    "other": ("🎁", 0x5865F2),
+}
+
+
+def classify_status(status: str) -> str:
+    lowered = status.lower()
+    if "success" in lowered:
+        return "success"
+    if "already" in lowered:
+        return "already"
+    if "expired" in lowered:
+        return "expired"
+    if "sign/auth" in lowered:
+        return "sign_error"
+    if "http error" in lowered or "request failed" in lowered:
+        return "error"
+    return "other"
+
+
+def send_discord_embed(code: str, fid: str, status: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         log("No DISCORD_WEBHOOK_URL configured, skipping notification.")
         return
+
+    kind = classify_status(status)
+    emoji, color = STATUS_STYLE[kind]
+
+    embed = {
+        "title": f"{emoji}  Kingshot Gift Code — {code}",
+        "color": color,
+        "fields": [
+            {"name": "Player FID", "value": f"`{fid}`", "inline": True},
+            {"name": "Result", "value": status, "inline": True},
+        ],
+        "footer": {"text": "Kingshot Auto-Redeemer"},
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
     try:
         requests.post(
             DISCORD_WEBHOOK_URL,
-            json={"content": content},
+            json={"embeds": [embed]},
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
@@ -219,19 +298,13 @@ def main() -> int:
             result = redeem_code(PLAYER_FID, code)
         except requests.RequestException as e:
             log(f"ERROR redeeming {code}: {e}")
-            send_discord_notification(
-                f"⚠️ Kingshot code **{code}** — request failed: {e}"
-            )
+            send_discord_embed(code, PLAYER_FID, f"Request failed: {e}")
             continue
 
         status = interpret_result(result)
         log(f"Result for {code}: {status}")
 
-        send_discord_notification(
-            f"🎁 New Kingshot code detected: **{code}**\n"
-            f"Player FID: `{PLAYER_FID}`\n"
-            f"Status: {status}"
-        )
+        send_discord_embed(code, PLAYER_FID, status)
 
         # Mark as seen regardless of outcome so we don't retry a dead code
         # forever; genuine transient failures can be re-added manually by
