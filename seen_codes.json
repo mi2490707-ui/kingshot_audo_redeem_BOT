@@ -1,3 +1,8 @@
 {
-  "seen": []
+  "seen": [
+    "activeCount",
+    "expiredCount",
+    "giftCodes",
+    "total"
+  ]
 }
