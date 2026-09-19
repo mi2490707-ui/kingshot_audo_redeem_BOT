@@ -3,8 +3,8 @@ name: Kingshot Gift Code Check
 on:
   schedule:
     # Runs at 00:00 and 12:00 UTC = 05:00 and 17:00 Pakistan time (PKT, UTC+5)
-    - cron: "0 0 * * *"
-    - cron: "0 12 * * *"
+   # - cron: "0 0 * * *"
+   # - cron: "0 12 * * *"
   workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
 
 permissions:
